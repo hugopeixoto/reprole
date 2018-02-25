@@ -16,6 +16,7 @@ import (
   "net/http"
   "net/url"
   "net/http/httputil"
+  "strings"
   "sync"
 )
 
@@ -118,11 +119,13 @@ func NewClient(endpoint string, filename string, email string) (*acme.Client, er
   return client, err
 }
 
+type Proxy struct {
+  Domains []string `json:"domains"`
+  Target string `json:"target"`
+}
+
 type Settings struct {
-  Proxies []struct {
-    Domains []string `json:"domains"`
-    Target string `json:"target"`
-  } `json:"proxies"`
+  Proxies []Proxy `json:"proxies"`
 }
 
 func (s *Settings) GetTarget(serverName string) (*url.URL, error) {
@@ -142,11 +145,15 @@ type CertificateStore struct {
   certificates map[string]*tls.Certificate
 }
 
-func (cs *CertificateStore) GetCertificate(serverName string) *tls.Certificate {
+func (cs *CertificateStore) GetCertificate(serverName string) (*tls.Certificate, error) {
   cs.lock.RLock()
   defer cs.lock.RUnlock()
 
-  return cs.certificates[serverName]
+  if cs.certificates[serverName] != nil {
+    return cs.certificates[serverName], nil
+  }
+
+  return nil, errors.New("unknown server name")
 }
 
 func (cs *CertificateStore) SetCertificate(serverNames []string, cert *tls.Certificate) {
@@ -162,32 +169,35 @@ func main() {
   client, err := NewClient("https://acme-staging.api.letsencrypt.org/directory", "tmp/user.json", "hugo.peixoto@gmail.com")
   log.Println(err)
 
-  client.SetHTTPAddress(":80")
+  client.SetHTTPAddress(":8080")
 
   settings := Settings{}
+
+  certstore := CertificateStore{}
 
   err = ReadJSON("tmp/proxy.json", &settings)
   log.Println(err)
 
-  domains := []string{"speakers-staging.porto.codes"}
+  for _, proxy := range settings.Proxies {
+    certRes, failures := client.ObtainCertificate(proxy.Domains, true, nil, false)
 
-  certs, failures := client.ObtainCertificate(domains, true, nil, false)
+    if len(failures) > 0 {
+      log.Fatalln(failures)
+    }
 
-  if len(failures) > 0 {
-    log.Println(failures)
-    return
+    cert, err := tls.X509KeyPair(certRes.Certificate, certRes.PrivateKey)
+    if err != nil {
+      panic(err)
+    }
+
+    certstore.SetCertificate(proxy.Domains, &cert)
   }
-
-  cert, err := tls.X509KeyPair(certs.Certificate, certs.PrivateKey)
-
-  //_, err = client.RenewCertificate(certRes, true, false)
-  log.Println(err)
 
   server := http.Server{
     Addr: ":https",
     TLSConfig: &tls.Config{
       GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-        return &cert, nil
+        return certstore.GetCertificate(chi.ServerName)
       },
     },
     Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -200,10 +210,34 @@ func main() {
         w.Write([]byte("\n"))
       } else {
         httputil.NewSingleHostReverseProxy(target).ServeHTTP(w, r)
-    }
+      }
     }),
   }
 
-  err = server.ListenAndServeTLS("", "")
-  log.Println(err)
+  serverhttp := http.Server{
+    Addr: ":http",
+    Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+      _, err := settings.GetTarget(r.Host)
+
+      if err != nil {
+        w.WriteHeader(404)
+        w.Write([]byte("unknown domain "))
+        w.Write([]byte(r.Host))
+        w.Write([]byte("\n"))
+      } else {
+        if strings.HasPrefix(r.RequestURI, "/.well-known/acme-challenge/") {
+          p, _ := url.Parse("http://localhost:8080")
+
+          httputil.NewSingleHostReverseProxy(p).ServeHTTP(w, r)
+        } else {
+          http.Redirect(w, r, "https://" + r.Host + r.RequestURI, http.StatusMovedPermanently)
+        }
+      }
+    }),
+  }
+
+  go func() { panic(server.ListenAndServeTLS("", "")) }()
+  go func() { panic(serverhttp.ListenAndServe()) }()
+
+  select {}
 }
