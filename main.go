@@ -110,9 +110,6 @@ func NewClient(endpoint string, filename string, email string) (*acme.Client, er
 		}
 	}
 
-	log.Println("pkey")
-	log.Println(user.Key.Key)
-
 	client.AgreeToTOS()
 
 	return client, err
@@ -164,6 +161,54 @@ func (cs *CertificateStore) SetCertificate(serverNames []string, cert *tls.Certi
 	}
 }
 
+func ensureProxyCertificate(
+	proxy Proxy,
+	client *acme.Client,
+	certstore *CertificateStore,
+) {
+	certjson := make(map[string]interface{})
+	err := ReadJSON("tmp/certificates/"+proxy.Domains[0]+".json", &certjson)
+
+	certRes := acme.CertificateResource{}
+	if err != nil {
+		log.Println(err)
+		certRes, _ = client.ObtainCertificate(proxy.Domains, true, nil, false)
+
+		payload, _ := json.Marshal(map[string]interface{}{
+			"Domain":        certRes.Domain,
+			"CertURL":       certRes.CertURL,
+			"CertStableURL": certRes.CertStableURL,
+			"AccountRef":    certRes.AccountRef,
+			"PrivateKey":    hex.EncodeToString(certRes.PrivateKey),
+			"Certificate":   hex.EncodeToString(certRes.Certificate),
+		})
+
+		err = ioutil.WriteFile("tmp/certificates/"+proxy.Domains[0]+".json", payload, 0600)
+	} else {
+		certRes.Domain = certjson["Domain"].(string)
+		certRes.CertURL = certjson["CertURL"].(string)
+		certRes.CertStableURL = certjson["CertStableURL"].(string)
+		certRes.AccountRef = certjson["AccountRef"].(string)
+		certRes.PrivateKey, _ = hex.DecodeString(certjson["PrivateKey"].(string))
+		certRes.Certificate, _ = hex.DecodeString(certjson["Certificate"].(string))
+	}
+
+	cert, err := tls.X509KeyPair(certRes.Certificate, certRes.PrivateKey)
+	if err != nil {
+		panic(err)
+	}
+
+	cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		panic(err)
+	}
+
+	certstore.SetCertificate(proxy.Domains, &cert)
+
+	// missing renew
+	log.Println(cert.Leaf.NotAfter)
+}
+
 func main() {
 	client, err := NewClient(
 		"https://acme-staging.api.letsencrypt.org/directory",
@@ -171,30 +216,21 @@ func main() {
 		"hugo.peixoto@gmail.com",
 	)
 
-	log.Println(err)
+	if err != nil {
+		panic(err)
+	}
 
 	client.SetHTTPAddress(":8080")
 
 	settings := Settings{}
 
-	certstore := CertificateStore{}
+	certstore := CertificateStore{
+		certificates: make(map[string]*tls.Certificate),
+	}
 
 	err = ReadJSON("tmp/proxy.json", &settings)
-	log.Println(err)
-
-	for _, proxy := range settings.Proxies {
-		certRes, failures := client.ObtainCertificate(proxy.Domains, true, nil, false)
-
-		if len(failures) > 0 {
-			log.Fatalln(failures)
-		}
-
-		cert, err := tls.X509KeyPair(certRes.Certificate, certRes.PrivateKey)
-		if err != nil {
-			panic(err)
-		}
-
-		certstore.SetCertificate(proxy.Domains, &cert)
+	if err != nil {
+		panic(err)
 	}
 
 	server := http.Server{
@@ -242,6 +278,10 @@ func main() {
 
 	go func() { panic(server.ListenAndServeTLS("", "")) }()
 	go func() { panic(serverhttp.ListenAndServe()) }()
+
+	for _, proxy := range settings.Proxies {
+		go ensureProxyCertificate(proxy, client, &certstore)
+	}
 
 	select {}
 }
